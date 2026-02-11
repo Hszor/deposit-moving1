@@ -174,7 +174,7 @@ def extract_window_data(df, window_dict):
 
     return window_data
 
-def run_feature_engineering(event_window_data, output_dir='results'):
+def run_feature_engineering(event_window_data, normal_window_data=None, output_dir='results'):
     """
     运行特征工程
     """
@@ -186,6 +186,37 @@ def run_feature_engineering(event_window_data, output_dir='results'):
     feature_dir = os.path.join(output_dir, 'feature_engineering')
     if not os.path.exists(feature_dir):
         os.makedirs(feature_dir)
+
+    # 数据质量检查：先验证原始指标可分性
+    if normal_window_data:
+        import matplotlib.pyplot as plt
+
+        print("\n【数据质量检查】原始指标均值对比")
+        for indicator in ['growth_gap', 'maturity_rate', 'high_rate_ratio']:
+            event_vals = []
+            for data in event_window_data.values():
+                if indicator in data:
+                    event_vals.extend(data[indicator])
+
+            normal_vals = []
+            for data in normal_window_data.values():
+                if indicator in data:
+                    normal_vals.extend(data[indicator])
+
+            event_mean = np.mean(event_vals) if event_vals else 0
+            normal_mean = np.mean(normal_vals) if normal_vals else 0
+            diff = event_mean - normal_mean
+
+            print(f"{indicator:20} 事件均值={event_mean:.4f}, 正常均值={normal_mean:.4f}, 差异={diff:.4f}")
+
+            # 分布可视化
+            plt.figure()
+            plt.hist(event_vals, alpha=0.5, label='事件窗口', bins=5)
+            plt.hist(normal_vals, alpha=0.5, label='正常窗口', bins=5)
+            plt.title(f'{indicator} 分布对比')
+            plt.legend()
+            plt.savefig(os.path.join(feature_dir, f'{indicator}_check.png'))
+            plt.close()
 
     # 初始化特征工程引擎
     feature_engine = WindowFeatureEngine()
@@ -670,47 +701,60 @@ def generate_2026_forecast(historical_df, n_quarters=4):
 
 def create_sample_data():
     """
-    创建包含结构特征的示例数据
-    修复：使用正确的频率代码'QE'代替'Q'
+    生成与已知事件/正常窗口严格对齐的结构化模拟数据
+    特征：增长缺口、存款到期率、高息存款占比
+    事件窗口：施加显著结构性冲击，三个指标同步恶化
+    正常窗口：保持基线水平，无冲击
     """
     np.random.seed(42)
 
-    # 生成时间序列 - 使用'QE'（季度末）频率
-    dates = pd.date_range('2005-01-01', '2025-12-31', freq='QE')  # 修复这里
+    # 1. 完整时间序列（2005-2025，季度末）
+    dates = pd.date_range('2005-01-01', '2025-12-31', freq='QE')
     n = len(dates)
 
-    # 创建趋势和周期性
-    t = np.arange(n) / n
+    # 2. 基线水平（正常时期）
+    growth_gap = np.full(n, -0.1)
+    maturity_rate = np.full(n, 0.005)
+    high_rate_ratio = np.full(n, 0.012)
 
-    # 趋势成分
-    trend = 0.5 * np.sin(2 * np.pi * t * 2)
+    # 添加小幅随机波动（正常波动范围）
+    growth_gap += np.random.normal(0, 0.05, n)
+    maturity_rate += np.random.normal(0, 0.0003, n)
+    high_rate_ratio += np.random.normal(0, 0.001, n)
 
-    # 周期性成分
-    seasonal = 0.3 * np.sin(2 * np.pi * t * 4) + 0.2 * np.sin(2 * np.pi * t * 1)
+    # 3. 对每个已知事件窗口施加结构性冲击（与日期严格对应）
+    strength_map = {
+        '2007牛市期': 0.8,
+        '2013余额宝期': 1.0,
+        '2015杠杆牛': 1.2,
+        '2020宽松期': 0.7,
+    }
+    for name, (start_str, end_str) in KNOWN_EVENT_WINDOWS.items():
+        start = pd.to_datetime(start_str)
+        end = pd.to_datetime(end_str)
+        mask = (dates >= start) & (dates <= end)
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            print(f"⚠️ 窗口 {name} 无对应数据")
+            continue
 
-    # 随机波动
-    random_walk = np.cumsum(np.random.normal(0, 0.1, n))
+        strength = strength_map.get(name, 0.8)
 
-    # 结构突变点（模拟存款搬家事件）
-    structural_shifts = np.zeros(n)
-    event_periods = [(20, 30), (40, 50), (70, 80)]  # 事件发生期
+        # 增长缺口：下降0.6%~1.2%
+        growth_gap[idx] += -strength - 0.2 * np.random.rand(len(idx))
 
-    for start, end in event_periods:
-        structural_shifts[start:end] = np.linspace(0, -1, end-start)
+        # 存款到期率：上升0.2%~0.5%
+        maturity_rate[idx] += 0.0025 * strength + 0.0005 * np.random.randn(len(idx))
 
-    # 生成增长缺口（负值表示存款增速低于M2）
-    growth_gap = -0.3 + trend + seasonal + random_walk * 0.5 + structural_shifts
-    growth_gap += np.random.normal(0, 0.1, n)  # 添加噪声
+        # 高息存款占比：上升0.3%~0.8%
+        high_rate_ratio[idx] += 0.004 * strength + 0.001 * np.random.randn(len(idx))
 
-    # 生成存款到期率（与增长缺口负相关）
-    maturity_rate = 0.005 - 0.0003 * growth_gap + 0.1 * np.abs(structural_shifts)
-    maturity_rate += np.random.normal(0, 0.0005, n)
-    maturity_rate = np.maximum(maturity_rate, 0.002)  # 确保正值
-
-    # 生成高息存款占比
-    high_rate_ratio = 0.015 + 0.005 * np.abs(structural_shifts) + np.random.normal(0, 0.002, n)
+    # 4. 强制业务边界
+    maturity_rate = np.maximum(maturity_rate, 0.002)
     high_rate_ratio = np.maximum(high_rate_ratio, 0.005)
+    high_rate_ratio = np.minimum(high_rate_ratio, 0.03)
 
+    # 5. 构造DataFrame
     df = pd.DataFrame({
         'date': dates,
         'growth_gap': growth_gap,
@@ -718,7 +762,7 @@ def create_sample_data():
         'high_rate_ratio': high_rate_ratio,
         'deposit_balance': np.cumsum(np.random.normal(50, 10, n)) + 10000,
         'm2_yoy': 8 + np.random.normal(0, 1, n),
-        'deposit_yoy': 7 + np.random.normal(0, 1, n)
+        'deposit_yoy': 7 + np.random.normal(0, 1, n),
     })
 
     return df
@@ -961,16 +1005,16 @@ def main(data_file=None, output_dir='results'):
             print("❌ 无法提取事件窗口数据，程序终止")
             return False
 
-        # 3. 特征工程
-        feature_engine, event_builder = run_feature_engineering(
-            event_window_data, output_dir
-        )
-
-        # 4. 准备正常窗口（负样本）
+        # 3. 准备正常窗口（负样本）
         normal_window_data = extract_window_data(historical_df, KNOWN_NORMAL_WINDOWS)
         if not normal_window_data:
             print("❌ 无法提取正常窗口数据，程序终止")
             return False
+
+        # 4. 特征工程（含原始指标可分性检查）
+        feature_engine, event_builder = run_feature_engineering(
+            event_window_data, normal_window_data, output_dir
+        )
 
         # 5. 训练半监督检测器（事件分布 vs 正常分布）
         event_feature_df = EventProfileBuilder(feature_engine).fit(event_window_data)
